@@ -192,15 +192,18 @@ exports.workers = {
     async (debug, runtime, payload) => {
       const { publisher, surveyorId } = payload
       const cohort = payload.cohort || 'control'
-      const { postgres } = runtime
+      const { postgres, prometheus } = runtime
+      let frozen = false
 
       if (!publisher) throw new Error('no publisher specified')
 
       const surveyorQ = await postgres.query('select frozen from surveyor_groups where id = $1 limit 1;', [surveyorId])
       if (surveyorQ.rowCount !== 1) {
+        report(true)
         throw new Error('surveyor does not exist')
       }
-      if (!surveyorQ.rows[0].frozen) {
+      ;({ frozen } = surveyorQ.rows[0])
+      if (!frozen) {
         const update = `
         insert into votes (id, cohort, tally, excluded, channel, surveyor_id) values ($1, $2, 1, $3, $4, $5)
         on conflict (id) do update set updated_at = current_timestamp, tally = votes.tally + 1;
@@ -212,6 +215,15 @@ exports.workers = {
           publisher,
           surveyorId
         ])
+      }
+      report()
+
+      function report (missing = false) {
+        prometheus.getMetric('vote_counter').inc({
+          surveyorId,
+          missing,
+          frozen
+        })
       }
     },
 
