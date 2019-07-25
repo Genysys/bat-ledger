@@ -1,11 +1,10 @@
 const client = require('prom-client')
-const SDebug = require('sdebug')
 const _ = require('underscore')
 const redis = require('redis')
-const debug = new SDebug('prometheus')
 const listenerPrefix = `listeners:prometheus:`
 const listenerChannel = `${listenerPrefix}${process.env.SERVICE}`
-let registerMetricsPerProcess = registerMetrics
+
+module.exports = Prometheus
 
 function Prometheus (config, runtime) {
   if (!(this instanceof Prometheus)) {
@@ -14,17 +13,18 @@ function Prometheus (config, runtime) {
 
   const { prometheus } = config
   if (!prometheus) return
+
+  const { label: dyno } = prometheus
   this.config = prometheus
   this.register = new client.Registry()
   this.client = client
   this.runtime = runtime
   this.metrics = {}
-  this.caches = {}
   this.shared = {}
-  this.listenerId = `${listenerPrefix}${this.config.label}`
+  this.listenerId = `${listenerPrefix}${dyno}`
+  this.cache = redis.createClient(prometheus.redis)
 
-  const defaultLabels = { dyno: this.config.label }
-  this.register.setDefaultLabels(defaultLabels)
+  this.register.setDefaultLabels({ dyno })
 
   const timeout = 10000
   this.timeout = timeout
@@ -36,18 +36,17 @@ function Prometheus (config, runtime) {
       this.runtime.captureException(e)
     }
   })
-  // scope it to the process
-  registerMetricsPerProcess(this)
-  registerMetricsPerProcess = _.noop
+  this.registerMetrics()
+  this.registerMetrics = _.noop
 }
 
-Prometheus.prototype.maintenance = function () {
-  const { interval, client, timeout, register } = this
+Prometheus.prototype.maintenance = async function () {
+  const { interval, timeout, client, register } = this
   this.interval = interval || client.collectDefaultMetrics({
     timeout,
     register
   })
-  this.merge()
+  await this.publish()
 }
 
 Prometheus.prototype.duration = function (start) {
@@ -56,101 +55,91 @@ Prometheus.prototype.duration = function (start) {
 }
 
 Prometheus.prototype.quit = function () {
-  const { interval, caches } = this
-  const { publisher, subscriber } = caches
+  const { interval, cache } = this
   clearInterval(interval)
-  if (publisher) {
-    publisher.quit()
-  }
-  if (subscriber) {
-    subscriber.del(this.listenerId)
-    subscriber.unsubscribe()
-    subscriber.quit()
+  if (cache) {
+    cache.quit()
   }
 }
 
-Prometheus.prototype.allMetrics = function () {
-  const { shared, register, client } = this
-  const valueList = _.values(shared)
-  const values = valueList.concat([register.getMetricsAsJSON()])
-  return client.AggregatorRegistry.aggregate(values)
+Prometheus.prototype.allMetrics = async function () {
+  const { client, cache } = this
+  const keys = await cache.keysAsync(`${listenerChannel}.*`)
+  const all = await cache.mgetAsync(keys)
+  const metrics = all.map(JSON.parse)
+  return client.AggregatorRegistry.aggregate(metrics)
 }
 
-function registerMetrics (prometheus) {
-  const { client, register } = prometheus
-  let name
+Prometheus.prototype.registerMetrics = function () {
+  const { client, register } = this
   const log2Buckets = client.exponentialBuckets(2, 2, 15)
 
-  name = 'http_request_duration_milliseconds'
-  register.removeSingleMetric(name)
-  const httpRequestDurationMilliseconds = new client.Summary({
-    name,
+  new client.Summary({ // eslint-disable-line
+    registers: [register],
+    name: 'http_request_duration_milliseconds',
     help: 'request duration in milliseconds',
     labelNames: ['method', 'path', 'cardinality', 'status']
   })
-  register.registerMetric(httpRequestDurationMilliseconds)
 
-  name = 'http_request_buckets_milliseconds'
-  register.removeSingleMetric(name)
-  const httpRequestBucketsMilliseconds = new client.Histogram({
-    name,
+  new client.Histogram({ // eslint-disable-line
+    registers: [register],
+    name: 'http_request_buckets_milliseconds',
     help: 'request duration buckets in milliseconds',
     labelNames: ['method', 'path', 'cardinality', 'status'],
     buckets: log2Buckets
   })
-  register.registerMetric(httpRequestBucketsMilliseconds)
 
-  const upholdApiRequestBucketsMilliseconds = new client.Histogram({
+  new client.Histogram({ // eslint-disable-line
+    registers: [register],
     name: 'uphold_request_buckets_milliseconds',
     help: 'uphold request duration buckets in milliseconds',
     labelNames: ['method', 'path', 'cardinality', 'status'],
     buckets: log2Buckets
   })
-  register.registerMetric(upholdApiRequestBucketsMilliseconds)
 
-  const anonizeVerifyRequestBucketsMilliseconds = new client.Histogram({
+  new client.Histogram({ // eslint-disable-line
+    registers: [register],
     name: 'anonizeVerify_request_buckets_milliseconds',
     help: 'anonize verify duration buckets in milliseconds',
     labelNames: ['method', 'path', 'cardinality', 'status', 'erred'],
     buckets: log2Buckets
   })
-  register.registerMetric(anonizeVerifyRequestBucketsMilliseconds)
 
-  const anonizeRegisterRequestBucketsMilliseconds = new client.Histogram({
+  new client.Histogram({ // eslint-disable-line
+    registers: [register],
     name: 'anonizeRegister_request_buckets_milliseconds',
     help: 'anonize register buckets in milliseconds',
     labelNames: ['method', 'path', 'cardinality', 'status', 'erred'],
     buckets: log2Buckets
   })
-  register.registerMetric(anonizeRegisterRequestBucketsMilliseconds)
 
-  const viewRefreshRequestBucketsMilliseconds = new client.Histogram({
+  new client.Histogram({ // eslint-disable-line
+    registers: [register],
     name: 'viewRefresh_request_buckets_milliseconds',
     help: 'postgres view refresh buckets in milliseconds',
     labelNames: ['method', 'path', 'cardinality', 'status', 'erred'],
     buckets: log2Buckets
   })
-  register.registerMetric(viewRefreshRequestBucketsMilliseconds)
+
+  new client.Counter({ // eslint-disable-line
+    registers: [register],
+    name: 'vote_counter',
+    help: 'vote counter',
+    labelNames: ['surveyorId', 'frozen', 'missing']
+  })
 }
 
 Prometheus.prototype.plugin = function () {
-  const { register } = this
   const plugin = {
     register: (server, o, done) => {
       server.route({
         method: 'GET',
         path: '/metrics',
-        handler: (req, reply) => {
-          const registry = this.allMetrics()
+        handler: async (req, reply) => {
+          const registry = await this.allMetrics()
           const metrics = registry.metrics()
           reply(metrics).type('text/plain')
         }
-      })
-
-      server.route({
-        method: 'GET',
-        path: '/metrics-internal',
-        handler: (req, reply) => reply(register.metrics()).type('text/plain')
       })
 
       server.ext('onRequest', (request, reply) => {
@@ -172,13 +161,17 @@ Prometheus.prototype.plugin = function () {
         for (let i = 0; i < path.length; i++) { if (path[i] === '?') path[i] = '{' + (params.shift() || '?') + '}' }
         path = path.join('/')
 
-        this.getMetric('http_request_duration_milliseconds')
-          .labels(method, path, cardinality, statusCode || 0)
-          .observe(duration)
+        const observables = {
+          method,
+          path,
+          cardinality,
+          status: statusCode || 0
+        }
+        this.metric('http_request_duration_milliseconds')
+          .observe(observables, duration)
 
-        this.getMetric('http_request_buckets_milliseconds')
-          .labels(method, path, cardinality, statusCode || 0)
-          .observe(duration)
+        this.metric('http_request_buckets_milliseconds')
+          .observe(observables, duration)
       })
 
       this.maintenance()
@@ -194,118 +187,33 @@ Prometheus.prototype.plugin = function () {
   return plugin
 }
 
-Prometheus.prototype.setCounter = async function (name, help, value) {
-  const { metrics, client } = this
-  if (!metrics[name]) metrics[name] = new client.Counter({ name, help })
-
-  metrics[name].reset()
-  metrics[name].inc(value)
+Prometheus.prototype.reset = async function (name) {
+  return this.metric(name).reset()
 }
 
-Prometheus.prototype.incrCounter = async function (name, help, delta) {
-  const { metrics, client } = this
-  if (!metrics[name]) metrics[name] = new client.Counter({ name, help })
-
-  metrics[name].inc(delta)
+Prometheus.prototype.increment = async function (name, labels = {}, delta = 1) {
+  return this.metric(name).inc(labels, delta)
 }
 
-Prometheus.prototype.setGauge = async function (name, help, value) {
-  const { metrics, client } = this
-  if (!metrics[name]) {
-    metrics[name] = new client.Gauge({ name, help })
-  }
-
-  metrics[name].set(value)
-}
-
-Prometheus.prototype.getMetric = function (name) {
-  return this.client.register.getSingleMetric(name)
+Prometheus.prototype.metric = function (name) {
+  return this.register.getSingleMetric(name)
 }
 
 Prometheus.prototype.timedRequest = function (name, knownObs = {}) {
-  const metric = this.getMetric(name)
+  const metric = this.metric(name)
   const start = process.hrtime()
   return (moreObs = {}) => {
     const duration = this.duration(start)
-    const hash = Object.assign({}, knownObs, moreObs)
-    const labels = _.map(metric.labelNames, (key) => hash[key])
-    metric.labels.apply(metric, labels).observe(duration)
+    const labels = Object.assign({}, knownObs, moreObs)
+    metric.observe(labels, duration)
   }
 }
 
-Prometheus.prototype.subscriber = function () {
-  const { caches, config } = this
-  let { subscriber } = caches
-  if (subscriber) {
-    return subscriber
-  }
-  subscriber = redis.createClient(config.redis)
-  caches.subscriber = subscriber
-
-  subscriber.on('connect', () => {
-    debug('listeners', { count: null, id: this.listenerId })
-    this.stayinAlive()
-    const list = subscriber.keys(`${listenerPrefix}*`)
-    debug('listeners', { list })
-    subscriber.subscribe(listenerChannel)
-  }).on('subscribe', async (channel, count) => {
-    debug('subscribe', { channel, count })
-    this.publish(_.values(this.shared || {}))
-  }).on('message', (channel, message) => {
-    let packet
-    try {
-      packet = JSON.parse(message)
-    } catch (ex) {
-      return debug('message', { channel, error: ex.toString() })
-    }
-    const { label, data } = packet
-    if (label === config.label) {
-      return
-    }
-    this.shared[label] = data
-  })
-
-  return subscriber
+Prometheus.prototype.publish = async function () {
+  const { register, timeout, listenerId, cache } = this
+  // x2 for buffer
+  const timeoutSeconds = (timeout / 1000) * 2
+  const data = register.getMetricsAsJSON()
+  const json = JSON.stringify(data)
+  await cache.setAsync(listenerId, json, 'EX', timeoutSeconds)
 }
-
-Prometheus.prototype.stayinAlive = function () {
-  const cache = this.publisher()
-  cache.set([this.listenerId, 'true', 'EX', 60])
-}
-
-Prometheus.prototype.publisher = function () {
-  const { caches, config } = this
-  let { publisher } = caches
-  if (publisher) {
-    return publisher
-  }
-  publisher = redis.createClient(config.redis)
-  caches.publisher = publisher
-  return publisher
-}
-
-Prometheus.prototype.publish = function (data) {
-  const publisher = this.publisher()
-  const { label } = this.config
-  const json = JSON.stringify({
-    data,
-    label
-  })
-  publisher.publish([listenerChannel, json])
-}
-
-Prometheus.prototype.merge = function () {
-  const { register, config } = this
-  const { label } = config
-
-  const entries = register.getMetricsAsJSON()
-  this.publish(entries)
-
-  if (label.includes('.worker.')) {
-    return
-  }
-  this.subscriber()
-  this.stayinAlive()
-}
-
-module.exports = Prometheus
