@@ -6,8 +6,8 @@ const boom = require('boom')
 const transactionsLib = require('../lib/transaction')
 const grantsLib = require('../lib/grants')
 
-const grantTypeValidator = Joi.string().allow(['ads'])
-const settlementTypeValidator = Joi.string().allow(['contribution', 'referrals'])
+const grantTypeValidator = Joi.string().valid(['ads'])
+const settlementTypeValidator = Joi.string().valid(['contribution', 'referral'])
 const numeric = braveJoi.string().numeric()
 const dateRangeParams = Joi.object().keys({
   start: Joi.date().iso().required().description('the date to start the query'),
@@ -61,10 +61,12 @@ v1.grantsStats = {
 
 v1.settlementsStats = {
   handler: (runtime) => async (request, reply) => {
-    const { params } = request
+    const { params, query } = request
+    const { currency } = query
     const { type } = params
     const client = await runtime.postgres.connect()
     const options = Object.assign({
+      currency,
       type: `${type}_settlement`
     }, backfillDateRange(params))
     try {
@@ -83,6 +85,9 @@ v1.settlementsStats = {
   description: 'Retrieves information about bat paid out in referrals',
   tags: [ 'api' ],
   validate: {
+    query: Joi.object().keys({
+      currency: braveJoi.string().anycurrencyCode().optional().default('BAT').description('the settlement currency to query for')
+    }),
     params: dateRangeParams.keys({
       type: settlementTypeValidator.description('settlement type to query for')
     })
